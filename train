@@ -1,0 +1,135 @@
+import os
+from env_tools.mape.make_env import make_env
+from qmix import QMIX
+import time
+import numpy as np
+
+train_parameters = {
+    "max_episode_len": 25,
+    "num_episodes": 100000,
+}
+
+model_parameters = {
+    "lr": 1.0e-4,
+    "buffer_size": 100000,
+    "sigma": 0.15,
+    "gamma": 0.95,
+    "batch_size": 1024,
+    "num_episodes": 100000,
+    "max_replay_buffer_len": 1024,
+    "tau": 0.01,
+    "epsilon": 0.99
+}
+
+scenario_name = "Simple_spread"
+
+# 创建相关的log和model的保存路径
+model_path = "./models/" + \
+             scenario_name + "/" + \
+             "QMIX" + "2021.12.18"
+log_path = "./logs/" + \
+           scenario_name + "/" + \
+           "QMIX" + "2021.12.18"
+
+if os.path.exists('models/' + scenario_name):
+    pass
+else:
+    os.mkdir('models/' + scenario_name)
+
+
+def train():
+    # 初始化环境
+    env = make_env(scenario_name=scenario_name, discrete_action_space=True, discrete_action_input=True)
+    env_info = env.get_env_info()
+
+    # 初始化QMIXAgent
+    QMIXAgent = QMIX(name="QMIXAgent",
+                     obs_shape=env.observation_space,
+                     act_space=env.action_space,
+                     agent_num=env.n,
+                     states_shape=env_info["state_shape"],
+                     parameters=model_parameters,
+                     log_path=log_path,
+                     model_path=model_path,
+                     create_summary_writer=True)
+
+    print('Starting training...')
+    episode = 0
+    epoch = 0
+    train_step = 0
+
+    while episode < train_parameters["num_episodes"]:
+        t_start = time.time()
+        obs_n = env.reset()  # list(agent_num,obs_shape)
+        state = env.get_state()
+        episode_steps = 0  # ndarray:(30,)=[x, x, ..., x]
+        episode_rewards = [0.0]
+        agent_rewards = [[0.0] for _ in range(env.n)]
+
+        while episode_steps < train_parameters["max_episode_len"]:
+            action_n = QMIXAgent.action(obs_n, evaluation=False)
+            new_obs_n, rew_n, done_n, _ = env.step(action_n)
+            s_next = env.get_state()
+            # new_obs_n:list(agent_num,obs_shape)
+            # rew_n:list(agent_num,)
+            # done_n:list(agent_num,)
+            done = all(done_n)
+            padded_n = np.empty([env.n])
+            padded_n = padded_n.tolist()
+            # 'padded': np.empty([self.size, self.episode_limit, 1])
+            # 与rew的维度一样
+
+            QMIXAgent.experience(state, s_next, obs_n, action_n, rew_n, new_obs_n, done_n, padded_n)
+
+            for i, rew in enumerate(rew_n):
+                # rew_n=[-7.8159842794827386, -7.8159842794827386, -7.8159842794827386]
+                episode_rewards[-1] += rew
+                # episode_rewards=[-23.447952838448217]
+                agent_rewards[i] += rew
+
+            if epoch % 50 == 0:
+                train_able = False
+                QMIXAgent.preupdate()
+                for i in range(env.n):
+                    if len(QMIXAgent.replay_buffers_n[i]) > QMIXAgent.max_replay_buffer_len:
+                        train_able = True
+
+                        QMIXAgent.update(train_step)
+                if train_able:
+                    train_step += 1
+
+            if done:
+                break
+
+            obs_n = new_obs_n
+            episode_steps += 1
+            epoch += 1
+
+        # print(time.time()-T)
+        if episode % 200 == 0:
+            print("episode {}: {} total reward, {} epoch, {} episode_steps, {} train_steps, {} time".format(
+                episode, agent_rewards, epoch, episode_steps, train_step, time.time() - t_start))
+            t_start = time.time()
+
+        episode += 1
+
+        for i, summary_writer in enumerate(QMIXAgent.summary_writer):
+            summary_writer.add_scalar('Reward/total_reward', episode_rewards[-1], episode)
+            summary_writer.add_scalar('Reward/Agent_reward', agent_rewards[i], episode)
+            summary_writer.add_scalar('Episode/episode_steps', episode_steps, episode)
+            summary_writer.flush()
+
+        if episode % 200 == 0:
+            # 保存模型参数
+            QMIXAgent.save_model()
+
+    # 关闭summary，回收资源
+    for summary_writer in QMIXAgent.summary_writer:
+        summary_writer.close()
+    env.close()
+    # 保存模型参数
+    QMIXAgent.save_model()
+
+
+if __name__ == '__main__':
+    train()
