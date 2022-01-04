@@ -1,0 +1,237 @@
+import torch.nn as nn
+import torch
+import torch.nn.functional as f
+from replay_buffer import ReplayBuffer
+import datetime
+from tensorboardX import SummaryWriter
+import numpy as np
+
+
+class QMIXNet(nn.Module):
+    def __init__(self, n_agents, state_shape, mixing_embed_dim=64):  # embed_dim：嵌入层
+        super(QMIXNet, self).__init__()
+        self.n_agents = n_agents
+        self.state_dim = int(np.prod(state_shape))  # state_dim=30
+        self.embed_dim = mixing_embed_dim  # embed_dim=64
+
+        self.hyper_w_1 = nn.Linear(self.state_dim, self.embed_dim * self.n_agents)  # input:state_dim(30),output:64*3=192
+        self.hyper_w_2 = nn.Linear(self.state_dim, self.embed_dim)  # input:state_dim(30),output:embed_dim(64)
+
+        # State dependent bias for hidden layer
+        self.hyper_b_1 = nn.Linear(self.state_dim, self.embed_dim)  # input:state_dim(30),output:embed_dim(64)
+
+        # V(s) instead of a bias for the last layers
+        self.hyper_b_2 = nn.Sequential(nn.Linear(self.state_dim, self.embed_dim),
+                                       nn.ReLU(),
+                                       nn.Linear(self.embed_dim, 1))  # input:state_dim(30),output:1
+
+    def forward(self, agent_qs, states):  # agent_qs：(batch_size, n_agents)
+        bs = agent_qs.shape[0]  # bs=batch_size
+        states = states.reshape(-1, self.state_dim)  # states:(batch_size, state_dim)=(1024, 30)
+        agent_qs = agent_qs.view(-1, 1, self.n_agents)  # agent_qs:(batch_size, 1, n_agents)=(1024, 1, 3)
+        # First layer
+        w1 = torch.abs(self.hyper_w_1(states))  # w1:(batch_size, embed_dim * n_agents)=(1024, 192)
+        b1 = self.hyper_b_1(states)  # b1:(batch_size, mbed_dim)=(1024, 64)
+        w1 = w1.view(-1, self.n_agents, self.embed_dim)  # w1:(batch_size, n_agents, embed_dim)=(1024, 3, 64)
+        b1 = b1.view(-1, 1, self.embed_dim)  # b1:(batch_size, 1, embed_dim)=(1024, 1, 64)
+        hidden = f.elu(torch.bmm(agent_qs, w1) + b1)  # hidden:(batch_size, 1, embed_dim)=(1024, 1, 64)
+
+        # Second layer
+        w_2 = torch.abs(self.hyper_w_2(states)).view(-1, self.embed_dim, 1)  # w_2:(batch_size, embed_dim, 1)=(1024, 64, 1)
+        # State-dependent bias
+        b2 = self.hyper_b_2(states).view(-1, 1, 1)  # b2:(batch_size, 1, 1)=(1024, 1, 1)
+        # Compute final output
+        y = torch.bmm(hidden, w_2) + b2  # y:(batch_size, 1, 1)=(1024, 1, 1)
+        # Reshape and return
+        q_tot = y.view(bs, -1, 1)  # q_tot:(1024, 1, 1)
+        return q_tot
+
+
+class RNN(nn.Module):
+    def __init__(self, input_shape, rnn_hidden_dim, n_actions):
+        super(RNN, self).__init__()
+        self.fc1 = nn.Linear(input_shape, rnn_hidden_dim)  # input:obs_shape(10), output:rnn_hidden_dim(64)
+        self.rnn = nn.Linear(rnn_hidden_dim, rnn_hidden_dim)  # input:rnn_hidden_dim(64), output:rnn_hidden_dim(64)
+        self.fc2 = nn.Linear(rnn_hidden_dim, n_actions)  # input:rnn_hidden_dim(64), output:n_actions(3)
+
+    def forward(self, obs):  # obs:(batch_size, obs_shape)=(1024, 10)
+        x = f.relu(self.fc1(obs))  # x:(batch_size, rnn_hidden_dim)=(1024, 64)
+        h = f.relu(self.rnn(x))  # h:(batch_size, rnn_hidden_dim)=(1024,64)
+        q = self.fc2(h)  # q:(batch_size, action_shape)=(1024, 5)
+        return q
+
+
+class QMIX:
+    def __init__(self,
+                 name,
+                 obs_shape,
+                 act_space,
+                 agent_num,
+                 states_shape,
+                 parameters,
+                 log_path,
+                 model_path,
+                 create_summary_writer):
+        self.name = name
+        self.obs_shape = obs_shape  # [Box(10,), Box(10,), Box(10,)]
+        self.n_actions = act_space  # [Discrete(5), Discrete(5), Discrete(5)]
+        self.n_agents = agent_num
+        self.states_shape = states_shape  # states_shape=30
+        self.parameters = parameters
+        self.log_path = log_path
+        self.model_path = model_path
+
+        self.eval_rnn_n = [RNN(input_shape=self.obs_shape[i].shape[0],
+                               rnn_hidden_dim=64, n_actions=self.n_actions[i].n)
+                           for i in range(self.n_agents)]  # 每个agent选动作的网络
+        self.target_rnn_n = [RNN(input_shape=self.obs_shape[i].shape[0],
+                                 rnn_hidden_dim=64, n_actions=self.n_actions[i].n)
+                             for i in range(self.n_agents)]
+
+        self.eval_qmix_net = QMIXNet(self.n_agents, self.states_shape)  # QMIXNet(5，10)
+        self.target_qmix_net = QMIXNet(self.n_agents, self.states_shape)
+
+# -------------------所有的网络都在一起训练，所以只需要一个优化器，同时更新n+1个网络的参数（智能体网络+qmix网络）-----------------------
+        self.all_parameters = []
+        for i in range(self.n_agents):
+            self.all_parameters += list(self.eval_rnn_n[i].parameters())
+        self.all_parameters += list(self.eval_qmix_net.parameters())
+        self.optimizers = torch.optim.RMSprop(self.all_parameters, lr=parameters["lr"])
+# ----------------------------------------------------------------------------------------------------------------------
+
+        self.replay_buffers_n = []
+        for i in range(self.n_agents):
+            self.replay_buffers_n.append(ReplayBuffer(self.parameters["buffer_size"]))
+        self.max_replay_buffer_len = parameters["max_replay_buffer_len"]
+        self.replay_sample_index = None
+
+        # 为每一个智能体构建可视化训练过程
+        if create_summary_writer:
+            current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            self.summary_writer = []
+            for i in range(self.n_agents):
+                train_log_dir = self.log_path + '/QMIX_Summary_' + current_time + "agent_" + str(i)
+                self.summary_writer.append(SummaryWriter(train_log_dir))
+                print('Init alg QMIX' + "agent_" + str(i))
+
+    # 更新网络参数
+    def update_target_weights(self, tau=1):
+        for eval_rnn, target_rnn in zip(self.eval_rnn_n, self.target_rnn_n):
+            for eval_param, target_param in zip(eval_rnn.parameters(), target_rnn.parameters()):
+                target_param.data.copy_(tau * eval_param + (1 - tau) * target_param)  # 直接将eval_param赋值给target_param
+        for qmix_eval_param, qmix_target_param in zip(self.eval_qmix_net.parameters(), self.target_qmix_net.parameters()):
+            qmix_target_param.data.copy_(tau * qmix_eval_param + (1 - tau) * qmix_target_param)
+
+    # 输入：obs_n:list(num_agent,obs_shape)
+    # 输出：action_n：(num_agent,1)
+    def action(self, obs_n, evaluation=False):
+        action_n = []
+        for i, obs in enumerate(obs_n):
+            obs = torch.as_tensor([obs], dtype=torch.float32)
+            action_value = self.eval_rnn_n[i](obs).detach().cpu()
+            if np.random.randn() <= self.parameters['epsilon']:
+                action = torch.max(action_value, 1)[1].item()
+            else:
+                action = np.random.randint(0, self.n_actions[i].n)
+            action_n.append(action)
+        return action_n
+
+    def experience(self, state, s_next, obs_n, act_n, rew_n, new_obs_n, done_n, padded_n):
+        for i in range(self.n_agents):
+            self.replay_buffers_n[i].add(state, s_next, obs_n[i], [act_n[i]], [rew_n[i]], new_obs_n[i],
+                                         [float(done_n[i])], [padded_n[i]])
+    # 注意加入了两个状态的量state, s_next
+
+    def save_model(self):
+        for i in range(self.n_agents):
+            torch.save(self.eval_rnn_n[i].state_dict(),
+                       self.model_path + "/QMIX_eval_nets_agent_" + str(i) + ".pth")
+
+    def load_actor(self):
+        for i in range(self.n_agents):
+            self.eval_rnn_n[i].load_state_dict(
+                torch.load(self.model_path + "/QMIX_eval_nets_agent_" + str(i) + ".pth"))
+
+    def preupdate(self):
+        self.replay_sample_index = None
+
+    def update(self, train_step):
+        # collect replay sample from all agents
+        replay_sample_index = self.replay_buffers_n[0].make_index(self.parameters['batch_size'])
+        state_n = []
+        s_next_n = []
+        obs_n = []
+        act_n = []
+        obs_next_n = []
+        rew_n = []
+        done_n = []
+        act_next_n = []
+        padded_n = []
+
+        for i in range(self.n_agents):
+            # replay_sample_index = idxes
+            state, s_next, obs, act, rew, obs_next, done, padded = self.replay_buffers_n[i].sample_index(replay_sample_index)
+            # obs_next = torch.as_tensor(obs_next, dtype=torch.float32)
+            state_n.append(torch.tensor(state, dtype=torch.float32))
+            s_next_n.append(torch.tensor(s_next, dtype=torch.float32))
+            obs_n.append(torch.tensor(obs, dtype=torch.float32))
+            obs_next_n.append(torch.tensor(obs_next, dtype=torch.float32))
+            act_n.append(torch.tensor(act, dtype=torch.int64))
+            done_n.append(torch.tensor(done, dtype=torch.float32))
+            rew_n.append(torch.tensor(rew, dtype=torch.float32))
+            padded_n.append(torch.tensor(padded, dtype=torch.float32))
+
+        for i, obs_next in enumerate(obs_next_n):
+            target_mu = self.target_rnn_n[i](obs_next)
+            act_next_n.append(torch.tensor(target_mu, dtype=torch.int64))
+
+        summaries = self.train((state_n, s_next_n, obs_n, act_n, rew_n, obs_next_n, done_n, act_next_n, padded_n))
+
+        # if train_step % 10 == 0:  # only update every 100 steps
+        self.update_target_weights(tau=self.parameters["tau"])
+
+        for i in range(self.n_agents):
+            for key in summaries.keys():
+                self.summary_writer[i].add_scalar(key, summaries[key], global_step=train_step)
+            self.summary_writer[i].flush()
+
+    def train(self, memories):
+        state_n, s_next_n, obs_n, act_n, rew_n, obs_next_n, done_n, act_next_n, padded_n = memories
+        q_evals_n = []
+        q_targets_n = []
+
+        for i in range(self.n_agents):
+            # 计算每个智能体的q_eval，最后合成为q_evals_n
+            q_eval = self.eval_rnn_n[i](obs_n[i])
+            q_eval = torch.gather(q_eval, 1, act_n[i])  # tensor(1024,1)
+            q_evals_n.append(q_eval)  # list(3,1)=[tensor(1024,1),tensor(1024,1),tensor(1024,1)]
+
+            # 计算每个智能体的q_target,最后合成为q_targets_n
+            q_next = self.target_rnn_n[i](obs_next_n[i]).detach()
+            q_next = q_next.max(1)[0]
+            q_target = q_next.unsqueeze(1)  # tensor(1024,1)
+            q_targets_n.append(q_target)
+
+        q_evals_n = torch.cat(q_evals_n, dim=-1)
+        q_targets_n = torch.cat(q_targets_n, dim=-1)
+        q_total_eval = self.eval_qmix_net(q_evals_n, state_n[0]).view(self.parameters['batch_size'], 1)
+        q_total_target = self.target_qmix_net(q_targets_n, s_next_n[0])
+        # 注意eval_qmix_net和target_qmix_net输入时，state_n和s_next_n的维度
+
+        reward_norm = (rew_n[0] - rew_n[0].mean()) / rew_n[0].std()
+
+        targets = reward_norm + self.parameters['gamma'] * q_total_target.view(self.parameters['batch_size'], 1)
+
+# ----------------------------计算一个loss,更新参数--------------------------------------------------------
+        padded_n = torch.cat(padded_n, dim=-1)
+        padded_n = torch.unsqueeze(padded_n, dim=0)
+        mask = 1 - padded_n.float()
+        td_error = (q_total_eval - targets).unsqueeze(0)
+        masked_td_error = mask * td_error  # 抹掉填充的经验的td_error
+        # 不能直接用mean，因为还有许多经验是没用的，所以要求和再比真实的经验数，才是真正的均值
+        loss = (masked_td_error ** 2).sum() / mask.sum()
+        self.optimizers.zero_grad()  # 优化器
+        loss.backward()
+        self.optimizers.step()
+        summaries = dict([['LOSS/loss', loss]])
+        return summaries
